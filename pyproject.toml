@@ -37,7 +37,10 @@ ignore-init-module-imports = true
 [project.optional-dependencies]
 dev = [
     "pre-commit",
-    "pylint"
+    "pylint",
+    "mypy>=1.0.0",
+    "types-PyYAML",
+    "types-tqdm"
 ]
 
 test = [

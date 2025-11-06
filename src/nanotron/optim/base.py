@@ -63,14 +63,14 @@ class BaseOptimizer(ABC):
         ...
 
     def inherit_from(self, cls) -> bool:
-        ...
+        """Check if this optimizer inherits from a given class."""
+        return isinstance(self, cls)
 
 
 Optimizer = TypeVar("Optimizer", BaseOptimizer, torch.optim.Optimizer)
 
 
 # Modified from torch.optim.Optimizer._process_value_according_to_param_policy
-@staticmethod
 def _process_value_according_to_param_policy(
     param: torch.Tensor,
     value: torch.Tensor,

@@ -34,3 +34,13 @@ repos:
         args:
           - -w
           - --ignore-words-list=nd,reacher,thist,ths,magent,ba,fo,doesnt
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 'v1.8.0'
+    hooks:
+      - id: mypy
+        args: [--config-file=mypy.ini, --show-error-codes]
+        additional_dependencies:
+          - types-PyYAML
+          - types-tqdm
+          - torch
+          - numpy

@@ -1,7 +1,7 @@
 import contextlib
 import random
 from dataclasses import dataclass
-from typing import MutableMapping, Optional, Tuple
+from typing import Generator, MutableMapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,7 +17,7 @@ class RandomState:
     torch_cpu: torch.Tensor
     torch_cuda: Optional[torch.Tensor]
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, RandomState)
             and all(v1 == v2 for v1, v2 in zip(self.random, other.random))
@@ -40,38 +40,38 @@ class RandomStates(MutableMapping[str, RandomState]):
         self._dict = dict.copy()
 
     @staticmethod
-    def check_type(key, value):
+    def check_type(key: str, value: RandomState) -> None:
         if not isinstance(key, str):
             raise ValueError(f"Expected key to be of type str. Got {type(key)}")
         if not isinstance(value, RandomState):
             raise ValueError(f"Expected value to be of type `nanotron.dataclass.RandomState`. Got {type(value)}")
 
-    def __getitem__(self, item):
+    def __getitem__(self, item: str) -> RandomState:
         return self._dict[item]
 
-    def __iter__(self):
+    def __iter__(self) -> Generator[str, None, None]:
         return self._dict.__iter__()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._dict)
 
-    def __delitem__(self, key):
+    def __delitem__(self, key: str) -> None:
         raise ValueError("Can't delete a random states key")
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: RandomState) -> None:
         if key not in self._dict:
             raise ValueError("Can't add a new random states after initialisation")
         self.check_type(key, value)
-        return self._dict.__setitem__(key, value)
+        self._dict.__setitem__(key, value)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, RandomStates):
             return False
 
         return self._dict == other._dict
 
 
-def set_random_seed(seed: int):
+def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
@@ -79,7 +79,7 @@ def set_random_seed(seed: int):
     random.seed(seed)
 
 
-def set_random_state(random_state: RandomState):
+def set_random_state(random_state: RandomState) -> None:
     random.setstate(random_state.random)
     np.random.set_state(random_state.numpy)
     torch.set_rng_state(random_state.torch_cpu)
@@ -89,7 +89,7 @@ def set_random_state(random_state: RandomState):
         assert random_state.torch_cuda is None
 
 
-def get_current_random_state():
+def get_current_random_state() -> RandomState:
     """Returns a snapshot of current random state"""
     return RandomState(
         random=random.getstate(),
@@ -100,7 +100,7 @@ def get_current_random_state():
 
 
 @contextlib.contextmanager
-def branch_random_state(random_states: RandomStates, key: str, enabled: bool):
+def branch_random_state(random_states: RandomStates, key: str, enabled: bool) -> Generator[None, None, None]:
     """
     Context manager handling random state:
      - upon entering: Stores current random state and set new random state defined by key.
@@ -130,7 +130,7 @@ def branch_random_state(random_states: RandomStates, key: str, enabled: bool):
 def get_synced_random_state(
     random_state: RandomState,
     pg: ProcessGroup,
-):
+) -> RandomState:
     # We use rank 0 as a reference and broadcast random states from that rank to all the other ranks within a group in order to sync them
     reference_rank = 0
     if dist.get_rank(pg) == reference_rank:

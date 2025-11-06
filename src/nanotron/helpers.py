@@ -49,7 +49,7 @@ from nanotron.serialize.metadata import TrainingMetadata
 logger = logging.get_logger(__name__)
 
 
-def _vocab_size_with_padding(orig_vocab_size: int, pg_size: int, make_vocab_size_divisible_by: int):
+def _vocab_size_with_padding(orig_vocab_size: int, pg_size: int, make_vocab_size_divisible_by: int) -> int:
     """Pad vocab size so it is divisible by pg_size * make_vocab_size_divisible_by."""
 
     multiple = make_vocab_size_divisible_by * pg_size
@@ -64,7 +64,7 @@ def _vocab_size_with_padding(orig_vocab_size: int, pg_size: int, make_vocab_size
     return after
 
 
-def init_random_states(parallel_config: ParallelismArgs, tp_pg: ProcessGroup):
+def init_random_states(parallel_config: ParallelismArgs, tp_pg: ProcessGroup) -> RandomStates:
     # Get synchronized random states
     if parallel_config is None or parallel_config.tp_mode is TensorParallelLinearMode.ALL_REDUCE:
         random_states = RandomStates(
@@ -76,7 +76,7 @@ def init_random_states(parallel_config: ParallelismArgs, tp_pg: ProcessGroup):
     return random_states
 
 
-def lr_scheduler_builder(optimizer: Optimizer, lr_scheduler_args: LRSchedulerArgs, total_training_steps: int):
+def lr_scheduler_builder(optimizer: Optimizer, lr_scheduler_args: LRSchedulerArgs, total_training_steps: int) -> LambdaLR:
     if lr_scheduler_args.lr_decay_steps is None:
         lr_decay_steps = total_training_steps
         if lr_scheduler_args.lr_warmup_steps is not None:
@@ -495,7 +495,7 @@ def test_equal_dict(first: Dict, second: Dict, sub_paths: Optional[List[str]] = 
             ), f"{first_elt} doesn't match {second_elt} at key {'.'.join(sub_paths + [str(key)])}"
 
 
-def get_profiler(config: Config):
+def get_profiler(config: Config) -> Union[profile, contextlib.nullcontext]:
     if config.profiler is not None and dist.get_rank() == 0:
         if config.profiler.profiler_export_path is not None:
             on_trace_ready = tensorboard_trace_handler(
@@ -562,7 +562,7 @@ def get_all_comps(n: int) -> List[List[List[int]]]:
 
 def test_all_pair_to_pair(
     parallel_context: ParallelContext, throughput_size: int, throughput_iters: int, only_node_to_node: bool = True
-):
+) -> None:
     """Test all pair-to-pair GPUs throughput
 
     Args:
@@ -622,13 +622,13 @@ def test_all_pair_to_pair(
 def create_table_log(
     config: Config,
     parallel_context: ParallelContext,
-    model_tflops,
-    hardware_tflops,
-    tokens_per_sec,
-    bandwidth,
-    num_params,
-    slurm_job_id,
-):
+    model_tflops: float,
+    hardware_tflops: float,
+    tokens_per_sec: float,
+    bandwidth: float,
+    num_params: Dict[str, int],
+    slurm_job_id: str,
+) -> List[LogItem]:
     return [
         LogItem("job_id", slurm_job_id, "s"),
         LogItem("name", config.general.run, "s"),
@@ -670,13 +670,13 @@ def create_table_log(
     ]
 
 
-def get_formatted_value(item):
+def get_formatted_value(item: LogItem) -> str:
     if item.log_format == "human_format":
         return human_format(item.scalar_value)
     return f"{item.scalar_value:{item.log_format}}"
 
 
-def create_table_output(table_log, column_widths):
+def create_table_output(table_log: List[LogItem], column_widths: List[int]) -> str:
     header_row = "| " + " | ".join([item.tag.ljust(width) for item, width in zip(table_log, column_widths)]) + " |"
     separator_row = "| " + " | ".join(["-" * width for width in column_widths]) + " |"
     data_row = (
@@ -687,7 +687,7 @@ def create_table_output(table_log, column_widths):
     return f"{header_row}\n{separator_row}\n{data_row}"
 
 
-def write_to_csv(csv_filename, table_log, model_tflops, slurm_job_id):
+def write_to_csv(csv_filename: str, table_log: List[LogItem], model_tflops: float, slurm_job_id: str) -> None:
     """Write benchmark results to a CSV file with file locking using fcntl."""
     import fcntl
 
@@ -768,12 +768,14 @@ def write_to_csv(csv_filename, table_log, model_tflops, slurm_job_id):
 def log_throughput(
     config: Config,
     parallel_context: ParallelContext,
-    model_tflops=0,
-    hardware_tflops=0,
-    tokens_per_sec=0,
-    bandwidth=0,
-    num_params={"total": 0, "local": 0},
-):
+    model_tflops: float = 0,
+    hardware_tflops: float = 0,
+    tokens_per_sec: float = 0,
+    bandwidth: float = 0,
+    num_params: Dict[str, int] = None,
+) -> None:
+    if num_params is None:
+        num_params = {"total": 0, "local": 0}
     slurm_job_id = os.environ.get("SLURM_JOB_ID", "N/A")
 
     table_log = create_table_log(
@@ -822,7 +824,7 @@ def compute_remain_train_steps_of_a_data_stage_from_ckp(
 
 def get_consumed_train_samples_of_a_data_stage_from_ckp(
     stage: DatasetStageArgs, metadata: TrainingMetadata
-) -> Optional[int]:
+) -> Tuple[int, Optional[Dict[str, int]]]:
     start_training_step = stage.start_training_step
 
     # find the stage in the metadata using the start_training_step
