@@ -466,6 +466,10 @@ def init_optimizer_and_grad_accumulator(
     # Register ZeRO-3 hooks for parameter sharding (FSDP)
     if optimizer_args.zero_stage == 3 and isinstance(optimizer, ZeroDistributedOptimizer):
         optimizer.register_zero3_hooks(model)
+        # If using DDP with FP32 accumulation, disable manual reduce-scatter
+        # (DDP hook handles it)
+        if isinstance(model, DistributedDataParallel) and grad_accumulator is not None:
+            optimizer._manual_reduce_scatter = False
 
     return optimizer, grad_accumulator
 

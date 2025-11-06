@@ -46,16 +46,28 @@ def test_zero_stage_parameter():
         return False
 
     # Check for parameter gathering methods
-    if 'def _all_gather_params_for_computation' in content:
-        print("✓ _all_gather_params_for_computation method found")
+    if 'def _gather_parameters' in content:
+        print("✓ _gather_parameters method found")
     else:
-        print("✗ _all_gather_params_for_computation method not found")
+        print("✗ _gather_parameters method not found")
         return False
 
-    if 'def _release_full_params' in content:
-        print("✓ _release_full_params method found")
+    if 'def _restore_sharded_params' in content:
+        print("✓ _restore_sharded_params method found")
     else:
-        print("✗ _release_full_params method not found")
+        print("✗ _restore_sharded_params method not found")
+        return False
+
+    if 'def _shard_parameters' in content:
+        print("✓ _shard_parameters method found")
+    else:
+        print("✗ _shard_parameters method not found")
+        return False
+
+    if 'def reduce_scatter_gradients' in content:
+        print("✓ reduce_scatter_gradients method found")
+    else:
+        print("✗ reduce_scatter_gradients method not found")
         return False
 
     # Check for conditional all-gather based on zero_stage

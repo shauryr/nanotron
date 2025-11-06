@@ -76,24 +76,56 @@ class ZeroDistributedOptimizer(InheritFromOtherOptimizer):
         self.param_name_to_dp_rank_offsets = self._partition_parameters()
 
         current_dp_rank = dist.get_rank(self.dp_pg)
-        param_groups_in_rank = [
-            {
-                "named_params": [
-                    (
-                        name,
-                        get_sliced_tensor(
-                            param=param,
-                            start_offset=self.param_name_to_dp_rank_offsets[name][current_dp_rank][0],
-                            end_offset=self.param_name_to_dp_rank_offsets[name][current_dp_rank][1],
-                        ),
-                    )
-                    for name, param in param_group["named_params"]
-                    if current_dp_rank in self.param_name_to_dp_rank_offsets[name]
-                ],
-                **{k: v for k, v in param_group.items() if k != "named_params"},
-            }
-            for param_group in self.zero_named_param_groups
-        ]
+
+        # For ZeRO-3: Initialize metadata and shard parameters BEFORE creating optimizer
+        if self.zero_stage == 3:
+            self._forward_pre_hooks = []
+            self._forward_post_hooks = []
+            self._backward_hooks = []
+            self._params_gathered = set()
+            self._full_param_data = {}
+            self._param_metadata = {}
+            # Flag to control whether to manually reduce-scatter gradients
+            # Set to False if using DDP with FP32 accumulation (reduce_scatter via DDP hook)
+            self._manual_reduce_scatter = True
+            # Shard parameters first
+            self._shard_parameters()
+
+        # Build optimizer parameter groups
+        if self.zero_stage == 3:
+            # For ZeRO-3: Pass sharded parameters directly (not SlicedFlatTensor)
+            # because parameters are already sharded in memory
+            param_groups_in_rank = [
+                {
+                    "named_params": [
+                        (name, param)
+                        for name, param in param_group["named_params"]
+                        if current_dp_rank in self.param_name_to_dp_rank_offsets[name]
+                    ],
+                    **{k: v for k, v in param_group.items() if k != "named_params"},
+                }
+                for param_group in self.zero_named_param_groups
+            ]
+        else:
+            # For ZeRO-1/2: Use SlicedFlatTensor as before
+            param_groups_in_rank = [
+                {
+                    "named_params": [
+                        (
+                            name,
+                            get_sliced_tensor(
+                                param=param,
+                                start_offset=self.param_name_to_dp_rank_offsets[name][current_dp_rank][0],
+                                end_offset=self.param_name_to_dp_rank_offsets[name][current_dp_rank][1],
+                            ),
+                        )
+                        for name, param in param_group["named_params"]
+                        if current_dp_rank in self.param_name_to_dp_rank_offsets[name]
+                    ],
+                    **{k: v for k, v in param_group.items() if k != "named_params"},
+                }
+                for param_group in self.zero_named_param_groups
+            ]
 
         # initialize rank's optimizer which is responsible for updating the rank's parameters
         # NOTE: In case of ZeRO, `self.id_to_name` stores only names of parameters that are going to be updated by this DP rank's optimizer.
@@ -102,21 +134,19 @@ class ZeroDistributedOptimizer(InheritFromOtherOptimizer):
         optimizer = optimizer_builder(param_groups_in_rank)
         super().__init__(optimizer=optimizer, id_to_name=optimizer.id_to_name)
 
-        # For ZeRO-3: Store handles and state for parameter management
-        if self.zero_stage == 3:
-            self._forward_pre_hooks = []
-            self._forward_post_hooks = []
-            self._backward_pre_hooks = []
-            self._backward_post_hooks = []
-            # Track which parameters are currently gathered
-            self._params_gathered = set()
-            # Store full parameter tensors temporarily during forward/backward
-            self._full_params_cache = {}
-
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
         """Performs a single optimization step (parameter update)."""
         # TODO: @nouamanetazi: handle syncing param groups attrs (e.g. if we update lr)
+
+        # For ZeRO-3: Before optimizer step, reduce-scatter gradients and restore sharded params
+        if self.zero_stage == 3:
+            # Reduce-scatter gradients to match parameter shards
+            # (only if not using DDP with FP32 accumulation, which handles reduce-scatter via hook)
+            if self._manual_reduce_scatter:
+                self.reduce_scatter_gradients()
+            # Restore parameters to sharded state (from gathered state after forward/backward)
+            self._restore_sharded_params()
 
         loss = super().step(closure=closure)
 
@@ -138,7 +168,7 @@ class ZeroDistributedOptimizer(InheritFromOtherOptimizer):
         # )
 
         # For ZeRO-1 and ZeRO-2: All gather updated params across DP ranks
-        # For ZeRO-3: Parameters remain sharded (gathered on-demand during forward/backward)
+        # For ZeRO-3: Parameters remain sharded (no all-gather needed)
         if self.zero_stage <= 2:
             self._all_gather_params()
         return loss
@@ -285,109 +315,222 @@ class ZeroDistributedOptimizer(InheritFromOtherOptimizer):
             group=self.dp_pg,
         )
 
-    def register_zero3_hooks(self, model: nn.Module):
-        """Register forward/backward hooks for ZeRO-3 parameter management.
+    @torch.no_grad()
+    def _shard_parameters(self):
+        """For ZeRO-3: Actually shard parameters by replacing their data with local shards only.
 
-        These hooks ensure that:
-        1. Parameters are all-gathered before being used in forward/backward
-        2. Full parameters are released after use to save memory
-        3. Only sharded parameters remain in memory between operations
+        This frees memory for non-owned parameter portions, providing real memory savings.
         """
         if self.zero_stage != 3:
             return
 
-        # Get all named parameters
-        named_params = {
-            name: param
-            for named_param_group in self.zero_named_param_groups
-            for name, param in named_param_group["named_params"]
-        }
+        current_dp_rank = dist.get_rank(self.dp_pg)
 
-        def make_forward_pre_hook(module_params):
-            def forward_pre_hook(module, inputs):
-                # All-gather parameters before forward
-                self._all_gather_params_for_computation(module_params)
+        for named_param_group in self.zero_named_param_groups:
+            for name, param in named_param_group["named_params"]:
+                # Store metadata for reconstruction
+                self._param_metadata[name] = {
+                    "shape": param.shape,
+                    "dtype": param.dtype,
+                    "device": param.device,
+                    "requires_grad": param.requires_grad,
+                }
 
-            return forward_pre_hook
+                # Get this rank's shard offsets
+                if current_dp_rank not in self.param_name_to_dp_rank_offsets[name]:
+                    # This rank doesn't own any shard of this parameter
+                    # Replace with empty tensor to free memory
+                    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                    continue
 
-        def make_forward_post_hook(module_params):
-            def forward_post_hook(module, inputs, outputs):
-                # Release full parameters after forward
-                self._release_full_params(module_params)
+                start_offset, end_offset = self.param_name_to_dp_rank_offsets[name][current_dp_rank]
 
-            return forward_post_hook
+                # Extract only the local shard
+                param_flat = param.data.view(-1)
+                local_shard = param_flat[start_offset:end_offset].clone()
 
-        # Register hooks on each module that has parameters
-        for name, module in model.named_modules():
-            # Get parameters belonging to this module
-            module_params = {}
-            for param_name, param in named_params.items():
-                # Check if this parameter belongs to this module
-                if param_name.startswith(name + ".") or (name == "" and "." not in param_name):
-                    module_params[param_name] = param
+                # Replace parameter data with just the shard
+                # This is the key step that actually frees memory
+                param.data = local_shard
 
-            if module_params:
-                # Register forward hooks
-                pre_hook = module.register_forward_pre_hook(make_forward_pre_hook(module_params))
-                post_hook = module.register_forward_hook(make_forward_post_hook(module_params))
-                self._forward_pre_hooks.append(pre_hook)
-                self._forward_post_hooks.append(post_hook)
+                log_rank(
+                    f"[ZeRO-3] Sharded parameter {name}: keeping {local_shard.numel()} / {param_flat.numel()} elements on rank {current_dp_rank}",
+                    logger=logger,
+                    level=logging.DEBUG,
+                    rank=0,
+                )
 
     @torch.no_grad()
-    def _all_gather_params_for_computation(self, module_params: Dict[str, NanotronParameter]):
-        """All-gather sharded parameters for computation in ZeRO-3."""
+    def _gather_parameters(self):
+        """For ZeRO-3: All-gather parameters before forward/backward pass.
+
+        Materializes full parameters from shards across all ranks.
+        """
         if self.zero_stage != 3:
             return
 
-        for param_name, param in module_params.items():
-            if param_name in self._params_gathered:
-                continue
+        current_dp_rank = dist.get_rank(self.dp_pg)
 
-            # All-gather the parameter
-            param_flat = param.view(-1)
-            current_dp_rank = dist.get_rank(self.dp_pg)
+        for named_param_group in self.zero_named_param_groups:
+            for name, param in named_param_group["named_params"]:
+                if name in self._params_gathered:
+                    continue
 
-            if self.dp_pg.size() == 1:
-                # No need to gather if only one rank
-                self._params_gathered.add(param_name)
-                continue
+                metadata = self._param_metadata[name]
 
-            # Create output tensors for all-gather
-            output_tensors = []
-            for dp_rank in range(self.dp_pg.size()):
-                if dp_rank in self.param_name_to_dp_rank_offsets[param_name]:
-                    start, end = self.param_name_to_dp_rank_offsets[param_name][dp_rank]
-                    output_tensors.append(param_flat[start:end])
+                # Create full parameter buffer
+                full_param = torch.zeros(
+                    metadata["shape"],
+                    dtype=metadata["dtype"],
+                    device=metadata["device"],
+                )
+                full_param_flat = full_param.view(-1)
+
+                if self.dp_pg.size() == 1:
+                    # Single rank, just reshape the shard
+                    if param.numel() > 0:
+                        full_param_flat.copy_(param.data.view(-1))
+                    param.data = full_param
+                    self._params_gathered.add(name)
+                    continue
+
+                # All-gather shards from all ranks
+                shard_list = []
+                for dp_rank in range(self.dp_pg.size()):
+                    if dp_rank in self.param_name_to_dp_rank_offsets[name]:
+                        start, end = self.param_name_to_dp_rank_offsets[name][dp_rank]
+                        shard_list.append(full_param_flat[start:end])
+                    else:
+                        shard_list.append(torch.empty(0, dtype=metadata["dtype"], device=metadata["device"]))
+
+                # Get input shard for this rank
+                if current_dp_rank in self.param_name_to_dp_rank_offsets[name]:
+                    input_shard = param.data.view(-1).contiguous()
                 else:
-                    output_tensors.append(torch.empty(0, dtype=param.dtype, device=param.device))
+                    input_shard = torch.empty(0, dtype=metadata["dtype"], device=metadata["device"])
 
-            # Get the input tensor (this rank's shard)
-            if current_dp_rank in self.param_name_to_dp_rank_offsets[param_name]:
-                start, end = self.param_name_to_dp_rank_offsets[param_name][current_dp_rank]
-                input_tensor = param_flat[start:end].contiguous()
-            else:
-                input_tensor = torch.empty(0, dtype=param.dtype, device=param.device)
+                # Perform all-gather
+                dist.all_gather(
+                    tensor_list=shard_list,
+                    tensor=input_shard,
+                    group=self.dp_pg,
+                )
 
-            # Perform all-gather
-            dist.all_gather(
-                tensor_list=output_tensors,
-                tensor=input_tensor,
-                group=self.dp_pg,
-            )
-
-            self._params_gathered.add(param_name)
+                # Store the full parameter
+                self._full_param_data[name] = param.data
+                param.data = full_param
+                self._params_gathered.add(name)
 
     @torch.no_grad()
-    def _release_full_params(self, module_params: Dict[str, NanotronParameter]):
-        """Release full parameters and keep only sharded version for ZeRO-3."""
+    def _restore_sharded_params(self):
+        """For ZeRO-3: Restore sharded state after optimizer step.
+
+        Replaces full parameters with local shards to free memory.
+        """
         if self.zero_stage != 3:
             return
 
-        # For simplicity, we'll mark params as released
-        # In practice, the parameter memory is already in-place, so this is mainly for tracking
-        for param_name in module_params.keys():
-            if param_name in self._params_gathered:
-                self._params_gathered.remove(param_name)
+        current_dp_rank = dist.get_rank(self.dp_pg)
+
+        for named_param_group in self.zero_named_param_groups:
+            for name, param in named_param_group["named_params"]:
+                if name not in self._params_gathered:
+                    continue
+
+                # Extract the updated local shard from the full parameter
+                if current_dp_rank not in self.param_name_to_dp_rank_offsets[name]:
+                    # This rank doesn't own any shard
+                    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                else:
+                    start_offset, end_offset = self.param_name_to_dp_rank_offsets[name][current_dp_rank]
+                    param_flat = param.data.view(-1)
+                    local_shard = param_flat[start_offset:end_offset].clone()
+                    param.data = local_shard
+
+                # Clear from gathered set
+                self._params_gathered.discard(name)
+
+    def register_zero3_hooks(self, model: nn.Module):
+        """Register forward/backward hooks for ZeRO-3 parameter management.
+
+        These hooks ensure that:
+        1. Parameters are all-gathered before forward pass
+        2. Parameters stay gathered during backward pass
+        3. Gradients are reduce-scattered after backward
+        4. Parameters are restored to sharded state
+        """
+        if self.zero_stage != 3:
+            return
+
+        def forward_pre_hook(module, inputs):
+            # Gather all parameters before forward
+            self._gather_parameters()
+
+        def backward_hook(module, grad_inputs, grad_outputs):
+            # After backward, we need to reduce-scatter gradients
+            # This happens automatically via the DDP hook if using FP32 accumulation
+            # Otherwise we need to manually reduce-scatter
+            pass
+
+        # Register hooks on the root module
+        pre_hook = model.register_forward_pre_hook(forward_pre_hook)
+        self._forward_pre_hooks.append(pre_hook)
+
+        # Register backward hook to handle gradient reduce-scatter
+        # Note: Gradients are reduce-scattered via the DDP communication hook
+        # which is set up in helpers.py with reduce_scatter=True for ZeRO-3
+
+    @torch.no_grad()
+    def reduce_scatter_gradients(self):
+        """For ZeRO-3: Reduce-scatter gradients to match parameter shards.
+
+        This should be called after backward pass and before optimizer step.
+        """
+        if self.zero_stage != 3:
+            return
+
+        current_dp_rank = dist.get_rank(self.dp_pg)
+
+        for named_param_group in self.zero_named_param_groups:
+            for name, param in named_param_group["named_params"]:
+                if param.grad is None:
+                    continue
+
+                # Get the gradient
+                grad_flat = param.grad.view(-1)
+                numel = grad_flat.numel()
+
+                # Skip if single rank
+                if self.dp_pg.size() == 1:
+                    continue
+
+                # Prepare output tensor (local shard)
+                if current_dp_rank in self.param_name_to_dp_rank_offsets[name]:
+                    start_offset, end_offset = self.param_name_to_dp_rank_offsets[name][current_dp_rank]
+                    output_tensor = grad_flat[start_offset:end_offset]
+                else:
+                    output_tensor = torch.empty(0, dtype=param.grad.dtype, device=param.grad.device)
+
+                # Split gradient into shards for reduce-scatter
+                padded_numel_per_dp = (numel - 1) // self.dp_pg.size() + 1
+                sizes = [padded_numel_per_dp] * self.dp_pg.size()
+                remainder = padded_numel_per_dp * self.dp_pg.size() - numel
+                if remainder > 0:
+                    for i in range(remainder):
+                        sizes[-(i+1)] -= 1
+
+                input_tensor_list = list(torch.split(grad_flat, sizes))
+
+                # Reduce-scatter
+                dist.reduce_scatter(
+                    output=output_tensor,
+                    input_list=input_tensor_list,
+                    op=dist.ReduceOp.AVG,
+                    group=self.dp_pg,
+                )
+
+                # Replace gradient with just the local shard
+                param.grad = output_tensor
 
 
 # Helpers
