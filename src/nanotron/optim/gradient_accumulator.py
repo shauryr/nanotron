@@ -352,24 +352,44 @@ def get_fp32_accum_hook(
             return fut
 
         if reduce_scatter:
-            raise NotImplementedError("Not implemented")
+            # ZeRO-2: Reduce-scatter gradients to save memory
             assert hasattr(accumulator, "param_name_to_offsets")
             grad_buffer_tensor_list = [
                 accumulator.get_grad_buffer(param_id_to_name[id(param)]).view(-1) for param in bucket.parameters()
             ]
             device = grad_buffer_tensor_list[0].device
             dtype = grad_buffer_tensor_list[0].dtype
-            output_tensor_list = [
-                grad_buffer[slice(*accumulator.param_name_to_offsets[param_id_to_name[id(param)]])]
-                if param_id_to_name[id(param)] in accumulator.param_name_to_offsets
-                else torch.empty(0, dtype=dtype, device=device)
-                for grad_buffer, param in zip(grad_buffer_tensor_list, bucket.parameters())
-            ]
-            input_tensor_lists = [
-                torch.split(grad_buffer, split_size_or_sections=len(grad_buffer) // dp_pg.size())
-                for grad_buffer in grad_buffer_tensor_list
-            ]
-            dist.reduce_scatter_coalesced(
+
+            # Output tensors will be the sharded gradients (each rank gets its slice)
+            output_tensor_list = []
+            input_tensor_lists = []
+
+            for grad_buffer, param in zip(grad_buffer_tensor_list, bucket.parameters()):
+                param_name = param_id_to_name[id(param)]
+
+                # Get the output slice for this rank
+                if param_name in accumulator.param_name_to_offsets:
+                    start_offset, end_offset = accumulator.param_name_to_offsets[param_name]
+                    output_tensor = grad_buffer[start_offset:end_offset]
+                else:
+                    output_tensor = torch.empty(0, dtype=dtype, device=device)
+
+                output_tensor_list.append(output_tensor)
+
+                # Split the full gradient buffer into chunks for each rank
+                # Need to match the partitioning scheme from ZeroDistributedOptimizer
+                numel = grad_buffer.numel()
+                padded_numel_per_dp = (numel - 1) // dp_cp_pg.size() + 1
+                sizes = [padded_numel_per_dp] * dp_cp_pg.size()
+                remainder = padded_numel_per_dp * dp_cp_pg.size() - numel
+                if remainder > 0:
+                    for i in range(remainder):
+                        sizes[-(i+1)] -= 1
+
+                input_tensor_list = torch.split(grad_buffer, sizes)
+                input_tensor_lists.append(list(input_tensor_list))
+
+            accumulator.fp32_grads_reduce_scatter_handle = dist.reduce_scatter_coalesced(
                 output_tensor_list=output_tensor_list,
                 input_tensor_lists=input_tensor_lists,
                 op=reduce_op,

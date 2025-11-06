@@ -86,8 +86,12 @@ def save_optimizer(
                     else:
                         return str(input_item)
 
-                # NOTE: if it's a ZeRO-1 optimzier, then we save how the parameters are sharded
+                # NOTE: Save ZeRO stage (1, 2, or 3)
+                config["configs"]["zero_stage"] = str(optimizer.zero_stage)
+
+                # NOTE: if it's a ZeRO optimizer, then we save how the parameters are sharded
                 # across data parallel dimension, so that we can reconstruct the optimizer states
+                # ZeRO-1, ZeRO-2, and ZeRO-3 all use the same partitioning scheme
                 assert optimizer.param_name_to_dp_rank_offsets is not None, "param_name_to_dp_rank_offsets is required"
                 config["configs"]["param_name_to_dp_rank_offsets"] = convert_to_string(
                     optimizer.param_name_to_dp_rank_offsets
