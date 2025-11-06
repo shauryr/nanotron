@@ -1,7 +1,7 @@
 import datetime
 import os
 from functools import cache, lru_cache
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from packaging import version
@@ -12,7 +12,11 @@ from torch.distributed.distributed_c10d import ProcessGroup
 from nanotron.utils import find_free_port
 
 torch_version_above_1_13 = version.parse(torch.__version__) >= version.parse("1.13.0")
-Work = dist.Work if torch_version_above_1_13 else dist._Work
+# Type alias for distributed work object (varies by PyTorch version)
+if torch_version_above_1_13:
+    WorkType = dist.Work
+else:
+    WorkType = dist._Work  # type: ignore[attr-defined]
 
 # Note: When debugging communication hangs, try decreasing this timeout.
 default_pg_timeout = datetime.timedelta(minutes=20)
@@ -33,7 +37,7 @@ def reduce_scatter_tensor(  # pylint: disable=function-redefined
     op: dist.ReduceOp = dist.ReduceOp.SUM,
     group: Optional[ProcessGroup] = None,
     async_op: bool = False,
-) -> Optional[Work]:
+) -> Optional[Any]:  # Returns WorkType but mypy has issues with dynamic types
     if group is None:
         group = dist.torch_dist.distributed_c10d._get_default_group()
 
@@ -49,8 +53,11 @@ def reduce_scatter_tensor(  # pylint: disable=function-redefined
 
 
 def all_gather_into_tensor(  # pylint: disable=function-redefined
-    output_tensor, input_tensor, group: Optional[ProcessGroup] = None, async_op: bool = False
-) -> Optional[Work]:
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group: Optional[ProcessGroup] = None,
+    async_op: bool = False
+) -> Optional[Any]:  # Returns WorkType but mypy has issues with dynamic types
     if group is None:
         group = dist.torch_dist.distributed_c10d._get_default_group()
 
@@ -124,7 +131,7 @@ def reduce_scatter_coalesced(
 
     work = dist.reduce_scatter(output_tensor_buffer, input_tensor_buffer_list, op=op, group=group, async_op=async_op)
 
-    def update_output():
+    def update_output() -> None:
         for original_buffer, reduced_buffer in zip(
             output_tensor_list, torch._utils._unflatten_dense_tensors(output_tensor_buffer, output_tensor_list)
         ):
@@ -135,6 +142,7 @@ def reduce_scatter_coalesced(
     else:
         # No need to run `work.wait()` since `dist.reduce_scatter` already waits
         update_output()
+        return None
 
 
 def all_reduce_coalesced(  # pylint: disable=function-redefined
@@ -147,7 +155,7 @@ def all_reduce_coalesced(  # pylint: disable=function-redefined
         group = dist.torch_dist.distributed_c10d._get_default_group()
 
     if group.size() == 1:
-        return
+        return None
 
     return dist.all_reduce_coalesced(tensors, op=op, group=group, async_op=async_op)
 
@@ -207,7 +215,7 @@ def all_gather_coalesced(  # pylint: disable=function-redefined
 
     work = dist.all_gather(output_tensor_buffer_list, input_tensor_buffer, group=group, async_op=async_op)
 
-    def update_output():
+    def update_output() -> None:
         for original_buffer_list, gathered_buffer_tensor in zip(output_tensor_lists, output_tensor_buffer_list):
             for original_buffer, gathered_buffer in zip(
                 original_buffer_list,
@@ -220,6 +228,7 @@ def all_gather_coalesced(  # pylint: disable=function-redefined
     else:
         # No need to run `work.wait()` since `dist.reduce_scatter` already waits
         update_output()
+        return None
 
 
 # This cache has a speedup of 4 tflops on a 7b model
@@ -232,7 +241,7 @@ def get_global_rank(group: ProcessGroup, group_rank: int) -> int:  # pylint: dis
         return dist.distributed_c10d._get_global_rank(group=group, rank=group_rank)
 
 
-def get_global_ranks(group: ProcessGroup) -> Tuple[int]:
+def get_global_ranks(group: ProcessGroup) -> Tuple[int, ...]:
     return tuple(sorted((get_global_rank(group, i) for i in range(group.size()))))
 
 

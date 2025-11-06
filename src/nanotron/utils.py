@@ -4,7 +4,7 @@ import os
 import random
 import socket
 from contextlib import ExitStack, contextmanager
-from typing import ContextManager, List, Optional
+from typing import Any, Callable, ContextManager, Dict, Generator, List, Optional, Tuple, Type
 
 import torch
 from packaging import version
@@ -25,9 +25,9 @@ class Singleton(type):
     ```
     """
 
-    _instances = {}
+    _instances: Dict[Type, Any] = {}
 
-    def __call__(cls, *args, **kwargs):
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
         if cls not in cls._instances:
             cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
         return cls._instances[cls]
@@ -39,36 +39,44 @@ class ContextManagers:
     in the `transformers` library.
     """
 
-    def __init__(self, context_managers: List[ContextManager]):
+    def __init__(self, context_managers: List[ContextManager[Any]]):
         self.context_managers = context_managers
         self.stack = ExitStack()
 
-    def __enter__(self):
+    def __enter__(self) -> None:
         for context_manager in self.context_managers:
             self.stack.enter_context(context_manager)
 
-    def __exit__(self, *args, **kwargs):
+    def __exit__(self, *args: Any, **kwargs: Any) -> None:
         self.stack.__exit__(*args, **kwargs)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({[context_manager.gen.__qualname__ for context_manager in self.context_managers]})"
+        # Extract context manager names safely
+        cm_names = []
+        for cm in self.context_managers:
+            if hasattr(cm, 'gen') and hasattr(cm.gen, '__qualname__'):
+                cm_names.append(cm.gen.__qualname__)
+            else:
+                cm_names.append(str(type(cm).__name__))
+        return f"{self.__class__.__name__}({cm_names})"
 
 
 @contextmanager
-def main_rank_first(group: Optional[dist.ProcessGroup] = None):
+def main_rank_first(group: Optional[dist.ProcessGroup] = None) -> Generator[None, None, None]:
     """Context manager that executes the code in the context with the rank zero of the group going first."""
     is_main = dist.get_rank(group) == 0
     if is_main:
         yield
 
-    dist.barrier(group)
+    if hasattr(dist, 'barrier'):
+        dist.barrier(group)
 
     if not is_main:
         yield
 
 
 @contextmanager
-def local_ranks_zero_first(group: Optional[dist.ProcessGroup] = None):
+def local_ranks_zero_first(group: Optional[dist.ProcessGroup] = None) -> Generator[None, None, None]:
     """Context manager that executes the code in the context with all the local rank zero of the group going first.
     Useful to run only once per node first (e.g. to create local files, etc)
     """
@@ -76,18 +84,19 @@ def local_ranks_zero_first(group: Optional[dist.ProcessGroup] = None):
     if is_main:
         yield
 
-    dist.barrier(group)
+    if hasattr(dist, 'barrier'):
+        dist.barrier(group)
 
     if not is_main:
         yield
 
 
-def checkpoint_method(attr_name: str):
+def checkpoint_method(attr_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator to checkpoint a method of a class."""
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             _self = args[0]
             checkpoint_activated = getattr(_self, attr_name)
             if checkpoint_activated:
@@ -119,7 +128,7 @@ def checkpoint_method(attr_name: str):
     return decorator
 
 
-def get_parameter_and_parent_module(target: str, root_module: nn.Module):
+def get_parameter_and_parent_module(target: str, root_module: nn.Module) -> Tuple[nn.Parameter, nn.Module, str]:
     module_path, _, param_name = target.rpartition(".")
 
     mod: torch.nn.Module = root_module.get_submodule(module_path)
@@ -142,7 +151,7 @@ def get_untyped_storage(tensor: torch.Tensor) -> torch.UntypedStorage:
         return tensor.storage().untyped()
 
 
-def tensor_from_untyped_storage(untyped_storage: torch.UntypedStorage, dtype: torch.dtype):
+def tensor_from_untyped_storage(untyped_storage: torch.UntypedStorage, dtype: torch.dtype) -> torch.Tensor:
     # TODO @thomasw21: Figure out what's the best Pytorch way of building a tensor from a storage.
     device = untyped_storage.device
     tensor = torch.empty([], dtype=dtype, device=device)

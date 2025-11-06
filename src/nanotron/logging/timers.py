@@ -2,7 +2,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -44,12 +44,12 @@ class TimerRecord:
     _cuda_events: List[tuple[torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
     _current_start_event: Optional[torch.cuda.Event] = None
 
-    def __enter__(self):
+    def __enter__(self) -> "TimerRecord":
         """Context manager support: Start the timer when entering a context."""
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
         """Context manager support: End the timer when exiting a context."""
         self.end()
         return False  # Don't suppress exceptions
@@ -198,7 +198,7 @@ class Timers:
     _instance = None
     _enabled = os.environ.get("ENABLE_TIMERS", "0") == "1"  # Add global enable/disable flag
 
-    def __new__(cls):
+    def __new__(cls) -> "Timers":
         if cls._instance is None:
             cls._instance = super(Timers, cls).__new__(cls)
             cls._instance._timers: Dict[str, TimerRecord] = {}
@@ -280,14 +280,20 @@ class Timers:
         # If we get here, we're being called as @nanotron_timer("name", timer_type)
         return self._create_timer_decorator(name, timer_type, cuda_sync, enabled)
 
-    def _create_timer_decorator(self, name, timer_type=TimerType.CUDA, cuda_sync=False, enabled=None):
+    def _create_timer_decorator(
+        self,
+        name: str,
+        timer_type: TimerType = TimerType.CUDA,
+        cuda_sync: bool = False,
+        enabled: Optional[bool] = None
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Create a decorator that times the execution of a function."""
 
-        def decorator(func):
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             import functools
 
             @functools.wraps(func)
-            def wrapper(*args, **kwargs):
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
                 with self(name, timer_type, cuda_sync, enabled):
                     return func(*args, **kwargs)
 
@@ -305,7 +311,7 @@ class Timers:
         if name in self._timers:
             self._timers[name].reset()
 
-    def log(self, name: str, logger=None, rank: Optional[int] = 0, group=None) -> None:
+    def log(self, name: str, logger: Any = None, rank: Optional[int] = 0, group: Any = None) -> None:
         """Log a specific timer on the specified rank."""
         if name not in self._timers:
             return
@@ -327,7 +333,7 @@ class Timers:
                 f"{avg_time:.2f}ms avg, {timer.call_count} calls"
             )
 
-    def log_all(self, logger=None, rank: Optional[int] = 0, group=None) -> None:
+    def log_all(self, logger: Any = None, rank: Optional[int] = 0, group: Any = None) -> None:
         """Log all timers on the specified rank."""
         if logger is None:
             logger = logging.get_logger(__name__)
@@ -352,7 +358,7 @@ class Timers:
                     )
             logger.info("----------------------------")
 
-    def items(self):
+    def items(self) -> Union[List[Any], Iterator[Tuple[str, TimerRecord]]]:
         if not self._enabled:
             return []
         return self._timers.items()
