@@ -502,6 +502,195 @@ def _test_zero_optimizer_with_tp(
     parallel_context.destroy()
 
 
+@pytest.mark.parametrize("tp,dp,pp", [pytest.param(1, i, 1) for i in range(2, min(4, available_gpus()) + 1)])
+@pytest.mark.parametrize("zero_stage", [2, 3])
+@rerun_if_address_is_in_use()
+def test_zero_optimizer_stage_2_and_3(tp: int, dp: int, pp: int, zero_stage: int):
+    """Test ZeRO-2 (gradient sharding) and ZeRO-3 (parameter sharding / FSDP)"""
+    init_distributed(pp=pp, dp=dp, tp=tp)(_test_zero_optimizer_stage_2_and_3)(zero_stage=zero_stage)
+
+
+def _test_zero_optimizer_stage_2_and_3(parallel_context: ParallelContext, zero_stage: int):
+    model = init_dummy_model(parallel_context=parallel_context)
+    optimizer = ZeroDistributedOptimizer(
+        named_params_or_groups=model.named_parameters(),
+        optimizer_builder=lambda named_param_groups: NamedOptimizer(
+            named_params_or_groups=named_param_groups,
+            optimizer_builder=lambda param_groups: torch.optim.AdamW(param_groups),
+        ),
+        dp_pg=parallel_context.dp_pg,
+        zero_stage=zero_stage,
+    )
+
+    # Verify zero_stage is set correctly
+    assert optimizer.zero_stage == zero_stage
+
+    index_to_name = [name for name, _ in model.named_parameters()]
+
+    # reference model
+    reference_model = init_dummy_model(parallel_context=parallel_context)
+    reference_optimizer = torch.optim.AdamW(reference_model.parameters())
+
+    # sync weights between reference_model and model
+    with torch.no_grad():
+        for (name, param), (ref_name, ref_param) in zip(model.named_parameters(), reference_model.named_parameters()):
+            assert name == ref_name
+            param.copy_(ref_param)
+
+    # Get infinite dummy data iterator
+    data_loader = iter(dummy_infinite_data_loader(pp_pg=parallel_context.pp_pg))
+    nb_optim_steps = 3
+    batches = [[next(data_loader)] for _ in range(nb_optim_steps)]
+    pipeline_engine = AllForwardAllBackwardPipelineEngine()
+
+    # Training loop
+    for i, batch in enumerate(batches):
+        # store original reference parameter
+        old_named_params = {name: param.detach().clone() for name, param in model.named_parameters()}
+
+        # Run forward/backward
+        losses = pipeline_engine.train_batch_iter(
+            model=model, pg=parallel_context.pp_pg, batch=batch, nb_microbatches=1, grad_accumulator=None
+        )
+        ref_losses = pipeline_engine.train_batch_iter(
+            model=reference_model, pg=parallel_context.pp_pg, batch=batch, nb_microbatches=1, grad_accumulator=None
+        )
+
+        # Check loss match
+        losses = list(losses)
+        ref_losses = list(ref_losses)
+        assert len(losses) == len(ref_losses)
+        for loss, ref_loss in zip(losses, ref_losses):
+            assert isinstance(loss["loss"], torch.Tensor)
+            assert isinstance(ref_loss["loss"], torch.Tensor)
+            torch.testing.assert_close(
+                loss["loss"], ref_loss["loss"], atol=0, rtol=0, msg=lambda msg: f"At iteration {i}, {msg}"
+            )
+
+        # Manually sync tied parameters' gradients
+        sync_tied_weights_gradients(module=model, parallel_context=parallel_context, grad_accumulator=None)
+        sync_tied_weights_gradients(module=reference_model, parallel_context=parallel_context, grad_accumulator=None)
+
+        # We rely on DDP to synchronize gradients across DP. We only need to manually synchronize them if we don't use DDP.
+        if not isinstance(model, DistributedDataParallel):
+            sync_gradients_across_dp(
+                model, dp_pg=parallel_context.dp_pg, reduce_op=dist.ReduceOp.AVG, grad_accumulator=None
+            )
+        if not isinstance(reference_model, DistributedDataParallel):
+            sync_gradients_across_dp(
+                reference_model, dp_pg=parallel_context.dp_pg, reduce_op=dist.ReduceOp.AVG, grad_accumulator=None
+            )
+
+        # Check gradients are synced across DP
+        for name, param in model.named_parameters():
+            assert_tensor_equal_over_group(param.grad, group=parallel_context.dp_pg)
+        for ref_name, ref_param in reference_model.named_parameters():
+            assert_tensor_equal_over_group(ref_param.grad, group=parallel_context.dp_pg)
+
+        # Check gradients are the same with reference_model
+        for (name, param), (ref_name, ref_param) in zip(model.named_parameters(), reference_model.named_parameters()):
+            assert name == ref_name
+            torch.testing.assert_close(
+                param.grad, ref_param.grad, atol=0, rtol=0, msg=lambda msg: f"At iteration {i}, {msg}"
+            )
+
+        assert len(optimizer.param_groups) == 1
+        assert len(list(model.named_parameters())) == len(optimizer.param_groups[0]["params"])
+        with torch.no_grad():
+            for (name, param), sliced_param in zip(model.named_parameters(), optimizer.param_groups[0]["params"]):
+                offsets = optimizer.param_name_to_dp_rank_offsets[name][dist.get_rank(parallel_context.dp_pg)]
+
+                # Check that weights are the same
+                expected_slice = param.view(-1)[slice(*offsets)].view_as(sliced_param)
+                torch.testing.assert_close(
+                    expected_slice,
+                    sliced_param,
+                    atol=0,
+                    rtol=0,
+                    msg=lambda msg: f"Weights don't match: {msg}\n - Expected slice: {expected_slice}\n - Got: {sliced_param}\n - Full gradient: {param}",
+                )
+                assert (
+                    expected_slice.data_ptr() == sliced_param.data_ptr()
+                ), "Parameters should actually share the same data pointer"
+
+                # Check gradients is the view
+                expected_slice = param.grad.view(-1)[slice(*offsets)].view_as(sliced_param.grad)
+                assert (
+                    expected_slice.data_ptr() == sliced_param.grad.data_ptr()
+                ), "Parameters should actually share the same data pointer"
+                torch.testing.assert_close(
+                    expected_slice,
+                    sliced_param.grad,
+                    atol=0,
+                    rtol=0,
+                    msg=lambda msg: f"Gradients don't match: {msg}\n - Expected slice: {expected_slice}\n - Got: {sliced_param.grad}\n - Full gradient: {param.grad}",
+                )
+
+        # Optimizer steps
+        optimizer.step()
+        optimizer.zero_grad()
+        reference_optimizer.step()
+        reference_optimizer.zero_grad()
+
+        # For ZeRO-3, parameters should still be synced after optimizer step
+        # (even though they remain sharded internally)
+        # For ZeRO-2, parameters are synced via all-gather
+        for name, param in model.named_parameters():
+            if zero_stage <= 2:
+                # ZeRO-1 and ZeRO-2 all-gather parameters after optimizer step
+                assert_tensor_equal_over_group(param, group=parallel_context.dp_pg)
+            assert param.grad is None
+
+        # Check that gradients are reset
+        for ref_name, ref_param in reference_model.named_parameters():
+            assert_tensor_equal_over_group(ref_param, group=parallel_context.dp_pg)
+            assert ref_param.grad is None
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                assert param.grad is None
+
+        # Check params are the same with reference_model
+        for (name, param), (ref_name, ref_param) in zip(model.named_parameters(), reference_model.named_parameters()):
+            assert name == ref_name
+            # For ZeRO-3, we need to gather parameters before comparison
+            if zero_stage <= 2:
+                torch.testing.assert_close(param, ref_param, msg=lambda msg: f"At iteration {i}, {msg}")
+
+        # Check params have been updated correctly
+        for (name, param) in model.named_parameters():
+            old_param = old_named_params[name]
+            if zero_stage <= 2:
+                assert not torch.allclose(param, old_param)
+
+        # We need to check that the optimizer states are the same
+        state_dict = optimizer.state_dict()
+        reference_state_dict = reference_optimizer.state_dict()
+        state = state_dict["state"]
+        ref_state = reference_state_dict["state"]
+        assert set(state) == set(ref_state)
+
+        for index, optim_state in state.items():
+            ref_optim_state = ref_state[index]
+
+            name = index_to_name[index]
+            offsets = optimizer.param_name_to_dp_rank_offsets[name][dist.get_rank(parallel_context.dp_pg)]
+
+            assert set(optim_state) == set(ref_optim_state)
+
+            for key in ["exp_avg", "exp_avg_sq"]:
+                value = optim_state[key]
+                ref_value = ref_optim_state[key]
+                torch.testing.assert_close(
+                    value,
+                    ref_value.view(-1)[slice(*offsets)].view_as(value),
+                    atol=0,
+                    rtol=0,
+                    msg=lambda msg: f"At iteration {i}, {msg}",
+                )
+
+    parallel_context.destroy()
+
+
 @rerun_if_address_is_in_use()
 def test_sliced_flat_tensor():
     init_distributed(1, 1, 1)(_test_sliced_flat_tensor)()
