@@ -418,6 +418,8 @@ class OptimizerArgs:
     def __post_init__(self):
         if self.weight_decay_exclude_named_params is None:
             self.weight_decay_exclude_named_params: List[str] = []
+        if self.zero_stage not in [0, 1, 2, 3]:
+            raise ValueError(f"zero_stage must be 0 (disabled), 1, 2, or 3 (FSDP), got {self.zero_stage}")
 
 
 @dataclass

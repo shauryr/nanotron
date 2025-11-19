@@ -412,6 +412,7 @@ def init_optimizer_and_grad_accumulator(
             named_params_or_groups=named_param_groups,
             optimizer_builder=optimizer_builder,
             dp_pg=parallel_context.dp_pg,
+            zero_stage=optimizer_args.zero_stage,
         )
 
         # SANITY CHECK: assert that optimizer's named_params point to model's params (check only the first one)
@@ -457,9 +458,18 @@ def init_optimizer_and_grad_accumulator(
                 },
             ),
             hook=get_fp32_accum_hook(
-                reduce_scatter=optimizer.inherit_from(ZeroDistributedOptimizer), reduce_op=dist.ReduceOp.AVG
+                reduce_scatter=optimizer.inherit_from(ZeroDistributedOptimizer) and optimizer.zero_stage >= 2,
+                reduce_op=dist.ReduceOp.AVG,
             ),
         )
+
+    # Register ZeRO-3 hooks for parameter sharding (FSDP)
+    if optimizer_args.zero_stage == 3 and isinstance(optimizer, ZeroDistributedOptimizer):
+        optimizer.register_zero3_hooks(model)
+        # If using DDP with FP32 accumulation, disable manual reduce-scatter
+        # (DDP hook handles it)
+        if isinstance(model, DistributedDataParallel) and grad_accumulator is not None:
+            optimizer._manual_reduce_scatter = False
 
     return optimizer, grad_accumulator
 
